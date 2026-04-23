@@ -19,7 +19,6 @@ import re
 import os
 import sys
 import uuid
-import enum
 import json
 import hashlib
 import logging
@@ -136,11 +135,10 @@ class TicketAnalysisWithDraft(TicketAnalysis):
 #  DATABASE (PostgreSQL via SQLAlchemy)
 # ═══════════════════════════════════════════════════════
 from sqlalchemy import (
-    create_engine, Column, String, Text, Boolean, DateTime, Enum as SAEnum,
+    create_engine, Column, String, Text, Boolean, DateTime, Enum as SAEnum, Uuid,
     text, inspect as sa_inspect,
 )
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy.dialects.postgresql import UUID as PGUUID
 import enum as _enum
 
 
@@ -169,7 +167,7 @@ Base = declarative_base()
 
 class Ticket(Base):
     __tablename__ = "tickets"
-    id = Column(PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
+    id = Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
     customer_name = Column(String(255), nullable=False)
     email_body = Column(Text, nullable=False)
     status = Column(SAEnum(TicketStatus, name="ticket_status", create_constraint=True),
@@ -191,38 +189,75 @@ class Ticket(Base):
 
 
 # ── Engine + Session ──
-_db_url = DATABASE_URL
-if _db_url and _db_url.startswith("postgres://"):
-    _db_url = _db_url.replace("postgres://", "postgresql://", 1)
+def _normalize_db_url(url: str) -> str:
+    if not url:
+        return ""
+    if url.startswith("postgres://"):
+        return url.replace("postgres://", "postgresql://", 1)
+    return url
 
-engine = None
-SessionLocal = None
 
-if _db_url:
-    engine = create_engine(
-        _db_url, echo=False,
-        pool_size=5, max_overflow=10, pool_pre_ping=True,
-    )
-    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+def _sqlite_url() -> str:
+    return f"sqlite:///{(_ROOT_DIR / 'triage_local.db').as_posix()}"
 
-    # ── Create tables + migrations on first run ──
-    if "db_initialized" not in st.session_state:
+
+def _create_engine_and_session(primary_url: str):
+    logger = logging.getLogger("finance_triage")
+    normalized = _normalize_db_url(primary_url)
+
+    if normalized:
         try:
-            Base.metadata.create_all(bind=engine)
-            with engine.begin() as conn:
+            if normalized.startswith("sqlite"):
+                eng = create_engine(
+                    normalized,
+                    echo=False,
+                    connect_args={"check_same_thread": False},
+                )
+            else:
+                eng = create_engine(
+                    normalized,
+                    echo=False,
+                    pool_size=3,
+                    max_overflow=5,
+                    pool_pre_ping=True,
+                    connect_args={"connect_timeout": 5},
+                )
+            with eng.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            return eng, sessionmaker(autocommit=False, autoflush=False, bind=eng), normalized
+        except Exception:
+            logger.info("Primary database unreachable. Using local SQLite.")
+
+    sqlite_db_url = _sqlite_url()
+    eng = create_engine(
+        sqlite_db_url,
+        echo=False,
+        connect_args={"check_same_thread": False},
+    )
+    return eng, sessionmaker(autocommit=False, autoflush=False, bind=eng), sqlite_db_url
+
+
+engine, SessionLocal, _active_db_url = _create_engine_and_session(DATABASE_URL)
+
+# ── Create tables + migrations on first run ──
+if "db_initialized" not in st.session_state:
+    try:
+        Base.metadata.create_all(bind=engine)
+        with engine.begin() as conn:
+            if engine.dialect.name == "postgresql":
                 try:
                     conn.execute(text("ALTER TYPE ticket_status ADD VALUE IF NOT EXISTS 'Open'"))
                 except Exception:
                     pass
-                inspector = sa_inspect(engine)
-                columns = [c["name"] for c in inspector.get_columns("tickets")]
-                if "is_read" not in columns:
-                    conn.execute(text("ALTER TABLE tickets ADD COLUMN is_read BOOLEAN NOT NULL DEFAULT FALSE"))
-                if "is_ai_draft_edited" not in columns:
-                    conn.execute(text("ALTER TABLE tickets ADD COLUMN is_ai_draft_edited BOOLEAN NOT NULL DEFAULT FALSE"))
-            st.session_state.db_initialized = True
-        except Exception as e:
-            st.error(f"Database initialization failed: {e}")
+            inspector = sa_inspect(engine)
+            columns = [c["name"] for c in inspector.get_columns("tickets")]
+            if "is_read" not in columns:
+                conn.execute(text("ALTER TABLE tickets ADD COLUMN is_read BOOLEAN NOT NULL DEFAULT FALSE"))
+            if "is_ai_draft_edited" not in columns:
+                conn.execute(text("ALTER TABLE tickets ADD COLUMN is_ai_draft_edited BOOLEAN NOT NULL DEFAULT FALSE"))
+        st.session_state.db_initialized = True
+    except Exception as e:
+        st.error(f"Database initialization failed: {e}")
 
 
 def _get_db():
@@ -244,7 +279,7 @@ def _get_llm():
     return ChatGroq(
         model="llama-3.3-70b-versatile",
         api_key=GROQ_API_KEY, temperature=0,
-        max_tokens=2048, request_timeout=60,
+        max_tokens=1024, request_timeout=30,
     )
 
 
@@ -508,7 +543,7 @@ def classify_urgency(email_text: str) -> dict:
                 {"role": "system", "content": _URGENCY_SYSTEM_PROMPT},
                 {"role": "user", "content": f"Classify this customer email:\n\n{clean}"},
             ],
-            temperature=0.0, max_tokens=512, stream=False,
+            temperature=0.0, max_tokens=256, stream=False,
         )
         raw = response.choices[0].message.content or ""
         text_r = raw.strip()
@@ -697,11 +732,11 @@ def fetch_emails_from_gmail(include_read: bool = False, max_emails: int = 5) -> 
                 "tickets": [], "message": str(e)}
 
     try:
+        since_date = (datetime.now() - timedelta(days=2)).strftime("%d-%b-%Y")
         if include_read:
-            search_criteria = "ALL"
-        else:
-            since_date = (datetime.now() - timedelta(days=2)).strftime("%d-%b-%Y")
             search_criteria = f'(SINCE "{since_date}")'
+        else:
+            search_criteria = f'(UNSEEN SINCE "{since_date}")'
         status, messages = mail.search(None, search_criteria)
         if status != "OK":
             db.close()
@@ -1266,7 +1301,7 @@ def _search_match(tkt: dict, query: str) -> bool:
 with st.sidebar:
     st.markdown(sidebar_header(), unsafe_allow_html=True)
 
-    if st.button("Fetch New Emails", key="sb_fetch", use_container_width=True, type="primary"):
+    if st.button("Fetch New Emails", key="sb_fetch", width="stretch", type="primary"):
         st.session_state.page = "fetch"
         st.session_state.sel = None
         st.rerun()
@@ -1305,7 +1340,7 @@ with st.sidebar:
         with ic:
             st.markdown(nav_icon_cell(icon_name, is_active), unsafe_allow_html=True)
         with bc:
-            if st.button(f"{label}{suffix}", key=f"nav_{key}", use_container_width=True, type=btn_type):
+            if st.button(f"{label}{suffix}", key=f"nav_{key}", width="stretch", type=btn_type):
                 st.session_state.tab = key
                 st.session_state.page = "main"
                 st.session_state.sel = None
@@ -1338,7 +1373,7 @@ with st.sidebar:
     m3.metric("Fraud", fraud_ct)
     m4.metric("Resolved", resolved_ct)
 
-    if st.button("Refresh", use_container_width=True):
+    if st.button("Refresh", width="stretch"):
         st.session_state.sel = None
         st.rerun()
 
@@ -1361,7 +1396,7 @@ if st.session_state.page == "fetch":
 
     bc, _ = st.columns([1, 2])
     with bc:
-        if st.button("Fetch Emails Now", type="primary", use_container_width=True):
+        if st.button("Fetch Emails Now", type="primary", width="stretch"):
             with st.spinner("Connecting to Gmail and processing emails…"):
                 result = _api_fetch_emails(include_read=include_read, max_emails=max_emails)
             st.session_state.fetch_res = result
@@ -1404,11 +1439,22 @@ if st.session_state.page == "fetch":
                 if i < len(result.get("tickets", [])) - 1:
                     st.divider()
         else:
-            st.markdown(
-                alert_bar("ab-amber", "mail-open", "#d97706",
-                          '<b>No new emails.</b> Try enabling "Include already-read emails".'),
-                unsafe_allow_html=True,
-            )
+            if skipped > 0:
+                st.markdown(
+                    alert_bar(
+                        "ab-amber",
+                        "mail-open",
+                        "#d97706",
+                        f"<b>No newly processable emails.</b> {skipped} duplicate email(s) were skipped.",
+                    ),
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    alert_bar("ab-amber", "mail-open", "#d97706",
+                              '<b>No new unread emails in the last 2 days.</b> Try enabling "Include already-read emails".'),
+                    unsafe_allow_html=True,
+                )
         if errs > 0:
             with st.expander(f"{errs} error(s)"):
                 for e in result.get("error_details", []):
@@ -1462,7 +1508,7 @@ def _render_detail(ticket: dict, key_prefix: str = "d"):
     if _st in ("New", "Open", "In Progress"):
         b1, b2, b3 = st.columns([1, 1, 1])
         with b1:
-            if st.button("Approve & Send", key=f"ap_{kp}_{tid}", type="primary", use_container_width=True):
+            if st.button("Approve & Send", key=f"ap_{kp}_{tid}", type="primary", width="stretch"):
                 with st.spinner("Sending email…"):
                     res = _api_approve(tid)
                 if res:
@@ -1474,14 +1520,14 @@ def _render_detail(ticket: dict, key_prefix: str = "d"):
                     st.session_state.sel = None
                     st.rerun()
         with b2:
-            if st.button("Close Ticket", key=f"cl_{kp}_{tid}", use_container_width=True):
+            if st.button("Close Ticket", key=f"cl_{kp}_{tid}", width="stretch"):
                 with st.spinner("Closing…"):
                     if _api_close(tid):
                         st.warning("Ticket closed without reply.")
                         st.session_state.sel = None
                         st.rerun()
         with b3:
-            if st.button("← Back to list", key=f"bk_{kp}_{tid}", use_container_width=True):
+            if st.button("← Back to list", key=f"bk_{kp}_{tid}", width="stretch"):
                 st.session_state.sel = None
                 st.rerun()
     else:
@@ -1489,7 +1535,7 @@ def _render_detail(ticket: dict, key_prefix: str = "d"):
         with c1:
             st.info(f"This ticket is **{_st}**.")
         with c2:
-            if st.button("← Back to list", key=f"bk2_{kp}_{tid}", use_container_width=True):
+            if st.button("← Back to list", key=f"bk2_{kp}_{tid}", width="stretch"):
                 st.session_state.sel = None
                 st.rerun()
 
@@ -1620,7 +1666,7 @@ if st.session_state.tab == "dashboard":
                 yaxis=dict(showgrid=True, gridcolor='#f3f4f6', tickfont=dict(size=10, color='#9ca3af')),
                 hoverlabel=dict(bgcolor='#1a1a2e', font_color='white', font_size=12),
             )
-            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+            st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
         else:
             st.caption("No volume data in the last 48 hours.")
         st.markdown('</div>', unsafe_allow_html=True)
@@ -1648,7 +1694,7 @@ if st.session_state.tab == "dashboard":
                 yaxis=dict(tickfont=dict(size=11, color='#1a1a2e', family='Inter')),
                 hoverlabel=dict(bgcolor='#1a1a2e', font_color='white', font_size=12),
             )
-            st.plotly_chart(fig2, use_container_width=True, config={"displayModeBar": False})
+            st.plotly_chart(fig2, width="stretch", config={"displayModeBar": False})
         else:
             st.caption("No merchant data extracted yet.")
         st.markdown('</div>', unsafe_allow_html=True)
@@ -1722,7 +1768,7 @@ if st.session_state.tab == "dashboard":
                 hovertemplate='%{label}: %{value} tickets<extra></extra>',
             ))
             fig_p.update_layout(height=250, margin=dict(l=0, r=0, t=0, b=0), paper_bgcolor='rgba(0,0,0,0)', showlegend=False)
-            st.plotly_chart(fig_p, use_container_width=True, config={"displayModeBar": False})
+            st.plotly_chart(fig_p, width="stretch", config={"displayModeBar": False})
         else:
             st.caption("No unresolved tickets.")
         st.markdown('</div>', unsafe_allow_html=True)
@@ -1742,7 +1788,7 @@ if st.session_state.tab == "dashboard":
                 hovertemplate='%{label}: %{value} tickets<extra></extra>',
             ))
             fig_c.update_layout(height=250, margin=dict(l=0, r=0, t=0, b=0), paper_bgcolor='rgba(0,0,0,0)', showlegend=False)
-            st.plotly_chart(fig_c, use_container_width=True, config={"displayModeBar": False})
+            st.plotly_chart(fig_c, width="stretch", config={"displayModeBar": False})
         else:
             st.caption("No tickets yet.")
         st.markdown('</div>', unsafe_allow_html=True)
@@ -1762,7 +1808,7 @@ if st.session_state.tab == "dashboard":
                 hovertemplate='%{label}: %{value}<extra></extra>',
             ))
             fig_s.update_layout(height=250, margin=dict(l=0, r=0, t=0, b=0), paper_bgcolor='rgba(0,0,0,0)', showlegend=False)
-            st.plotly_chart(fig_s, use_container_width=True, config={"displayModeBar": False})
+            st.plotly_chart(fig_s, width="stretch", config={"displayModeBar": False})
         else:
             st.caption("No tickets yet.")
         st.markdown('</div>', unsafe_allow_html=True)
@@ -1819,7 +1865,7 @@ elif st.session_state.tab == "inbox":
             email_row(sender, subject, preview, pri, cat, ts, is_read, selected),
             unsafe_allow_html=True,
         )
-        if st.button("Open", key=f"{key_prefix}_{tid}", use_container_width=True):
+        if st.button("Open", key=f"{key_prefix}_{tid}", width="stretch"):
             st.session_state.sel = tid
             st.rerun()
 
@@ -1924,7 +1970,7 @@ elif st.session_state.tab == "queue":
                 with c2:
                     st.markdown(cat_badge(t.get("category", "General")), unsafe_allow_html=True)
                 with c3:
-                    if st.button("Open →", key=f"q_{t['id']}", use_container_width=True):
+                    if st.button("Open →", key=f"q_{t['id']}", width="stretch"):
                         st.session_state.sel = t["id"]
                         st.session_state.tab = "inbox"
                         st.rerun()
@@ -1963,7 +2009,7 @@ elif st.session_state.tab == "category":
                 with c2:
                     st.markdown(pri_badge(t.get("priority", "Medium")), unsafe_allow_html=True)
                 with c3:
-                    if st.button("Open →", key=f"c_{t['id']}", use_container_width=True):
+                    if st.button("Open →", key=f"c_{t['id']}", width="stretch"):
                         st.session_state.sel = t["id"]
                         st.session_state.tab = "inbox"
                         st.rerun()
@@ -2029,7 +2075,7 @@ elif st.session_state.tab == "alerts":
                                    pri, cat, snt, _fmt_time(t.get("created_at")), reasons),
                 unsafe_allow_html=True,
             )
-            if st.button("View Details →", key=f"al_{t['id']}", use_container_width=True):
+            if st.button("View Details →", key=f"al_{t['id']}", width="stretch"):
                 st.session_state.sel = t["id"]
                 st.session_state.tab = "inbox"
                 st.rerun()

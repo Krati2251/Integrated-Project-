@@ -16,12 +16,10 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from collections import Counter
 import plotly.graph_objects as go
-import plotly.express as px
 
 # Import HTML template helpers from templates.py
 from templates import (
-    icon, avatar, pri_badge, cat_badge, sent_badge, tag_html,
-    top_bar, sidebar_header, nav_icon_cell, fetch_how_it_works,
+    icon, avatar, pri_badge, cat_badge, top_bar, sidebar_header, nav_icon_cell, fetch_how_it_works,
     alert_bar, detail_actions, detail_header, insight_grid,
     email_row, welcome_empty, queue_section_header, section_header,
     chart_title_html, analytics_card, sla_breach_row,
@@ -53,6 +51,13 @@ for k, v in {
     "page": "main",
     "read_ids": set(),
     "search_query": "",
+    "quiz_data": None,
+    "quiz_q_index": 0,
+    "quiz_score": 0,
+    "quiz_complete": False,
+    "quiz_feedback": None,
+    "quiz_topic": "Finance",
+    "quiz_num_questions": 5,
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -269,6 +274,16 @@ def _api_fetch_emails(include_read: bool = False, max_emails: int = 5):
         return None
 
 
+def _sync_inbox(include_read: bool = False, max_emails: int = 20):
+    """Force a backend email fetch, then reload tickets into the current UI."""
+    fetch_result = _api_fetch_emails(include_read=include_read, max_emails=max_emails)
+    st.session_state.fetch_res = fetch_result
+    refreshed = _fetch_tickets("All")
+    st.session_state.all_tickets = refreshed
+    st.session_state.tickets = refreshed
+    return fetch_result
+
+
 def _api_dashboard_metrics():
     """Fetch enterprise dashboard metrics from the backend."""
     try:
@@ -279,6 +294,73 @@ def _api_dashboard_metrics():
         return None
 
 
+def _api_quiz_generate(topic: str = "Finance", num_questions: int = 5):
+    """Generate a quiz from backend quiz service."""
+    try:
+        r = requests.get(
+            f"{API}/quiz/generate",
+            params={"topic": topic, "num_questions": num_questions},
+            timeout=45,
+        )
+        r.raise_for_status()
+        payload = r.json()
+        return payload.get("data", payload)
+    except Exception as e:
+        st.error(f"Quiz generation failed: {e}")
+        return None
+
+
+def _api_quiz_score(question_id: int, selected_option: str, quiz_data: dict):
+    """Score an answer using backend quiz service."""
+    try:
+        r = requests.post(
+            f"{API}/quiz/score",
+            json={
+                "question_id": question_id,
+                "selected_option": selected_option,
+                "quiz_data": quiz_data,
+            },
+            timeout=15,
+        )
+        r.raise_for_status()
+        payload = r.json()
+        return payload.get("data", payload)
+    except Exception:
+        return None
+
+
+def _extract_quiz_questions(quiz_payload):
+    """Normalize quiz payload into a question list."""
+    if isinstance(quiz_payload, list):
+        return quiz_payload
+    if not isinstance(quiz_payload, dict):
+        return []
+    return (
+        quiz_payload.get("questions")
+        or quiz_payload.get("quiz")
+        or next((v for v in quiz_payload.values() if isinstance(v, list)), [])
+    )
+
+
+def _fallback_quiz_score(question: dict, selected_option: str):
+    """Fallback scorer for malformed responses or temporary API issues."""
+    options = question.get("options") or []
+    correct_answer = question.get("correct_answer") or question.get("answer")
+    if not correct_answer:
+        for opt in options:
+            if isinstance(opt, dict) and opt.get("correct"):
+                correct_answer = opt.get("text")
+                break
+    is_correct = selected_option == correct_answer
+    return {
+        "is_correct": bool(is_correct),
+        "selected": selected_option,
+        "correct_answer": correct_answer or "N/A",
+        "explanation": question.get("explanation", ""),
+        "points": 1 if is_correct else 0,
+    }
+
+
 # ═══════════════════════════════════════════════════════
 #  SIDEBAR
 # ═══════════════════════════════════════════════════════
@@ -286,6 +368,15 @@ with st.sidebar:
     st.markdown(sidebar_header(), unsafe_allow_html=True)
 
     if st.button("Fetch New Emails", key="sb_fetch", use_container_width=True, type="primary"):
+        with st.spinner("Syncing inbox…"):
+            _sync_inbox(include_read=False, max_emails=20)
+        st.session_state.page = "fetch"
+        st.session_state.sel = None
+        st.rerun()
+
+    if st.button("Fetch Read Emails", key="sb_fetch_read", use_container_width=True):
+        with st.spinner("Syncing read emails…"):
+            _sync_inbox(include_read=True, max_emails=20)
         st.session_state.page = "fetch"
         st.session_state.sel = None
         st.rerun()
@@ -314,6 +405,7 @@ with st.sidebar:
         ("queue",     "zap",         "Priority Queue",  high_ct if high_ct else None),
         ("category",  "tag",         "By Category",     None),
         ("alerts",    "bell",        "Alerts",          fraud_ct if fraud_ct else None),
+        ("quiz",      "play",        "Play Quiz",       None),
     ]
 
     for key, icon_name, label, count in nav_items:
@@ -358,6 +450,8 @@ with st.sidebar:
     m4.metric("Resolved", resolved_ct)
 
     if st.button("Refresh", use_container_width=True):
+        with st.spinner("Syncing inbox…"):
+            _sync_inbox(include_read=False, max_emails=20)
         st.session_state.sel = None
         st.rerun()
 
@@ -382,7 +476,7 @@ if st.session_state.page == "fetch":
     with bc:
         if st.button("Fetch Emails Now", type="primary", use_container_width=True):
             with st.spinner("Connecting to Gmail and processing emails…"):
-                result = _api_fetch_emails(include_read=include_read, max_emails=max_emails)
+                result = _sync_inbox(include_read=include_read, max_emails=max_emails)
             st.session_state.fetch_res = result
 
     result = st.session_state.fetch_res
@@ -1104,4 +1198,141 @@ elif st.session_state.tab == "alerts":
             if st.button("View Details →", key=f"al_{t['id']}", use_container_width=True):
                 st.session_state.sel = t["id"]
                 st.session_state.tab = "inbox"
+                st.rerun()
+
+
+# ──────────────────────────────────────────────────────
+#  TAB: QUIZ BOX
+# ──────────────────────────────────────────────────────
+elif st.session_state.tab == "quiz":
+    st.markdown(top_bar("Quiz Box"), unsafe_allow_html=True)
+    st.caption("Play an AI-generated finance quiz from the integrated backend quiz service.")
+
+    c1, c2, c3 = st.columns([3, 2, 2])
+    with c1:
+        topic = st.text_input("Quiz topic", value=st.session_state.quiz_topic)
+        st.session_state.quiz_topic = topic.strip() or "Finance"
+    with c2:
+        num_questions = st.slider("Number of questions", 3, 10, int(st.session_state.quiz_num_questions))
+        st.session_state.quiz_num_questions = int(num_questions)
+    with c3:
+        st.markdown(" ")
+        if st.button("Play Quiz", use_container_width=True, type="primary"):
+            with st.spinner("Generating quiz..."):
+                generated = _api_quiz_generate(
+                    topic=st.session_state.quiz_topic,
+                    num_questions=st.session_state.quiz_num_questions,
+                )
+            if generated:
+                st.session_state.quiz_data = generated
+                st.session_state.quiz_q_index = 0
+                st.session_state.quiz_score = 0
+                st.session_state.quiz_complete = False
+                st.session_state.quiz_feedback = None
+                st.rerun()
+
+    quiz_payload = st.session_state.quiz_data
+    if not quiz_payload:
+        st.info("Click Play Quiz to start a new round.")
+        st.stop()
+
+    questions = _extract_quiz_questions(quiz_payload)
+    if not questions:
+        st.error("Quiz payload does not contain any questions.")
+        st.json(quiz_payload)
+        st.stop()
+
+    total_questions = len(questions)
+    q_idx = min(st.session_state.quiz_q_index, total_questions - 1)
+
+    if st.session_state.quiz_complete:
+        pct = (st.session_state.quiz_score / total_questions) * 100 if total_questions else 0
+        st.success(
+            f"Quiz Complete: {st.session_state.quiz_score}/{total_questions} "
+            f"({pct:.0f}%)"
+        )
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button("Play Again", use_container_width=True, type="primary"):
+                with st.spinner("Generating quiz..."):
+                    regenerated = _api_quiz_generate(
+                        topic=st.session_state.quiz_topic,
+                        num_questions=st.session_state.quiz_num_questions,
+                    )
+                if regenerated:
+                    st.session_state.quiz_data = regenerated
+                    st.session_state.quiz_q_index = 0
+                    st.session_state.quiz_score = 0
+                    st.session_state.quiz_complete = False
+                    st.session_state.quiz_feedback = None
+                    st.rerun()
+        with b2:
+            if st.button("Clear Quiz", use_container_width=True):
+                st.session_state.quiz_data = None
+                st.session_state.quiz_q_index = 0
+                st.session_state.quiz_score = 0
+                st.session_state.quiz_complete = False
+                st.session_state.quiz_feedback = None
+                st.rerun()
+        st.stop()
+
+    current_question = questions[q_idx] if isinstance(questions[q_idx], dict) else {}
+    question_text = (
+        current_question.get("question")
+        or current_question.get("question_text")
+        or f"Question {q_idx + 1}"
+    )
+    raw_options = current_question.get("options") or []
+    option_texts = [
+        (opt.get("text") if isinstance(opt, dict) else str(opt))
+        for opt in raw_options
+    ]
+    option_texts = [opt for opt in option_texts if opt]
+
+    if not option_texts:
+        st.error("Current quiz question has no options.")
+        st.json(current_question)
+        st.stop()
+
+    st.progress((q_idx + 1) / total_questions)
+    st.markdown(f"### Question {q_idx + 1} of {total_questions}")
+    st.write(question_text)
+    st.caption(f"Current score: {st.session_state.quiz_score}")
+
+    selected_option = st.radio(
+        "Choose one option",
+        option_texts,
+        key=f"quiz_choice_{q_idx}",
+    )
+
+    feedback = st.session_state.quiz_feedback
+    if feedback is None:
+        if st.button("Submit Answer", key=f"quiz_submit_{q_idx}", type="primary"):
+            question_id = current_question.get("id", q_idx + 1)
+            result = _api_quiz_score(question_id, selected_option, quiz_payload)
+            if result is None:
+                result = _fallback_quiz_score(current_question, selected_option)
+
+            st.session_state.quiz_score += int(result.get("points", 0))
+            st.session_state.quiz_feedback = result
+            st.rerun()
+    else:
+        if feedback.get("is_correct"):
+            st.success("Correct answer")
+        else:
+            st.error(f"Not quite. Correct answer: {feedback.get('correct_answer', 'N/A')}")
+
+        explanation = feedback.get("explanation")
+        if explanation:
+            st.info(explanation)
+
+        if q_idx < total_questions - 1:
+            if st.button("Next Question", key=f"quiz_next_{q_idx}", use_container_width=True):
+                st.session_state.quiz_q_index += 1
+                st.session_state.quiz_feedback = None
+                st.rerun()
+        else:
+            if st.button("Finish Quiz", key="quiz_finish", use_container_width=True, type="primary"):
+                st.session_state.quiz_complete = True
+                st.session_state.quiz_feedback = None
                 st.rerun()

@@ -11,7 +11,7 @@ An AI-powered system that fetches customer support emails, classifies them by pr
 
 ## ✨ Features
 
-- **Auto-fetch emails** from Gmail via IMAP every 5 minutes (keeps the service alive)
+- **Auto-fetch emails** from Gmail via IMAP every 10 seconds by default (keeps the service alive)
 - **AI analysis** — sentiment, intent, priority, category, entity extraction in a single LLM call
 - **Multi-tier urgency classifier** — 3 tiers × 12 subcategories with two-pass priority resolution
 - **Auto-generated draft replies** tailored to Fraud / Payment Issue / General categories
@@ -115,7 +115,7 @@ Copy the connection string (e.g. `postgresql://user:pass@host:5432/dbname`).
 
 ### Keep-Alive Mechanism
 
-The app uses `streamlit_autorefresh` with a **5-minute interval** that:
+The app uses `streamlit_autorefresh` together with backend polling every 10 seconds by default that:
 - Auto-refreshes the dashboard UI
 - Triggers automatic email fetching from Gmail
 - Prevents Streamlit Cloud from putting the app to sleep

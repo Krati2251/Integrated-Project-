@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 from typing import Optional, List
+from uuid import UUID as _UUID
 import os, re, smtplib, logging, asyncio
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -13,6 +14,7 @@ from models import Ticket, TicketStatus, TicketPriority, TicketCategory
 from schemas import AnalyzeRequest, TicketAnalysis, ProcessTicketResponse
 from agent import analyze_ticket, generate_draft_response, analyze_and_draft
 from urgency_classifier import classify_urgency, get_parent_category
+from quiz_api import quiz_router
 
 load_dotenv()
 
@@ -46,6 +48,13 @@ def _extract_subject(email_body: str) -> str:
         if stripped.lower().startswith("subject:"):
             return "Re: " + stripped.split(":", 1)[1].strip()
     return "Finance Support Response"
+
+
+def _quote_mailbox(mailbox: str) -> str:
+    """Return a mailbox name in the quoted form Gmail's IMAP server accepts."""
+    if mailbox.startswith('"') and mailbox.endswith('"'):
+        return mailbox
+    return f'"{mailbox}"'
 
 
 def send_reply_email(to_email: str, subject: str, body: str) -> bool:
@@ -121,7 +130,7 @@ async def lifespan(app: FastAPI):
     print("✅ Database tables are ready.")
 
     # ── Background email polling (Railway keeps the process alive) ──
-    EMAIL_POLL_INTERVAL = int(os.getenv("EMAIL_POLL_INTERVAL", "300"))  # seconds (5 min)
+    EMAIL_POLL_INTERVAL = int(os.getenv("EMAIL_POLL_INTERVAL", "10"))  # seconds
     ENABLE_EMAIL_POLLING = os.getenv("ENABLE_EMAIL_POLLING", "true").lower() == "true"
     _BACKEND_PORT = os.getenv("PORT", "8000")
 
@@ -132,7 +141,9 @@ async def lifespan(app: FastAPI):
         while True:
             try:
                 import requests as _req
-                resp = _req.post(
+                # Run blocking HTTP call off the event loop so API endpoints stay responsive.
+                resp = await asyncio.to_thread(
+                    _req.post,
                     f"http://127.0.0.1:{_BACKEND_PORT}/fetch_emails?max_emails=5",
                     timeout=300,  # 5 min timeout (AI analysis can be slow)
                 )
@@ -173,6 +184,9 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+# Include quiz router
+app.include_router(quiz_router)
 
 # Allow Streamlit (port 8501) to call the API
 app.add_middleware(
@@ -232,8 +246,16 @@ def calculate_dashboard_metrics(db: Session) -> dict:
     from datetime import datetime as _dt, timezone as _tz, timedelta as _td
     from collections import Counter as _Counter
 
+    def _to_utc_naive(ts):
+        """Normalize mixed DB datetimes (aware/naive) to naive UTC for safe comparisons."""
+        if not ts:
+            return None
+        if ts.tzinfo is None:
+            return ts
+        return ts.astimezone(_tz.utc).replace(tzinfo=None)
+
     all_tickets = db.query(Ticket).order_by(Ticket.created_at.desc()).all()
-    now = _dt.now(_tz.utc)
+    now = _dt.utcnow()
 
     _OPEN = {TicketStatus.OPEN, TicketStatus.NEW, TicketStatus.IN_PROGRESS}
     _CLOSED = {TicketStatus.RESOLVED, TicketStatus.CLOSED}
@@ -251,8 +273,8 @@ def calculate_dashboard_metrics(db: Session) -> dict:
     sla_breaches = [
         t for t in open_tickets
         if t.priority == TicketPriority.HIGH
-        and t.created_at
-        and t.created_at < sla_threshold
+        and _to_utc_naive(t.created_at)
+        and _to_utc_naive(t.created_at) < sla_threshold
     ]
 
     # ── 3. Fraud Exposure (sum of amounts for ALL fraud tickets) ──
@@ -266,8 +288,9 @@ def calculate_dashboard_metrics(db: Session) -> dict:
     # ── 5. Avg Resolution Time ──
     resolution_hours = []
     for t in closed_tickets:
-        if t.created_at:
-            delta = (now - t.created_at).total_seconds() / 3600
+        created_at = _to_utc_naive(t.created_at)
+        if created_at:
+            delta = (now - created_at).total_seconds() / 3600
             resolution_hours.append(delta)
     avg_resolution_h = sum(resolution_hours) / len(resolution_hours) if resolution_hours else 0
 
@@ -275,8 +298,9 @@ def calculate_dashboard_metrics(db: Session) -> dict:
     cutoff_48h = now - _td(hours=48)
     hourly_counts: dict[str, int] = {}
     for t in all_tickets:
-        if t.created_at and t.created_at >= cutoff_48h:
-            hour_key = t.created_at.strftime("%Y-%m-%d %H:00")
+        created_at = _to_utc_naive(t.created_at)
+        if created_at and created_at >= cutoff_48h:
+            hour_key = created_at.strftime("%Y-%m-%d %H:00")
             hourly_counts[hour_key] = hourly_counts.get(hour_key, 0) + 1
     # Fill in missing hours
     volume_by_hour = []
@@ -305,8 +329,9 @@ def calculate_dashboard_metrics(db: Session) -> dict:
         if cat_closed:
             deltas = []
             for t in cat_closed:
-                if t.created_at:
-                    deltas.append((now - t.created_at).total_seconds() / 3600)
+                created_at = _to_utc_naive(t.created_at)
+                if created_at:
+                    deltas.append((now - created_at).total_seconds() / 3600)
             cat_avg_h = sum(deltas) / len(deltas) if deltas else 0
         reopen = sum(1 for t in cat_all if t.status == TicketStatus.OPEN)
         category_perf.append({
@@ -321,7 +346,8 @@ def calculate_dashboard_metrics(db: Session) -> dict:
     # ── 9. SLA breach detail list ──
     sla_detail = []
     for t in sla_breaches:
-        hrs_open = (now - t.created_at).total_seconds() / 3600 if t.created_at else 0
+        created_at = _to_utc_naive(t.created_at)
+        hrs_open = (now - created_at).total_seconds() / 3600 if created_at else 0
         sla_detail.append({
             "id": str(t.id),
             "customer_name": t.customer_name,
@@ -563,6 +589,14 @@ def _ticket_to_dict(ticket: Ticket) -> dict:
     }
 
 
+def _ticket_uuid(ticket_id: str) -> _UUID:
+    """Parse an incoming ticket id into a UUID for SQLAlchemy UUID columns."""
+    try:
+        return _UUID(str(ticket_id))
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"Invalid ticket id: {ticket_id}")
+
+
 @app.get("/tickets")
 def list_tickets(
     status: Optional[str] = Query(None, description="Filter by status: Open, New, In Progress, Resolved, Closed"),
@@ -604,7 +638,7 @@ def list_tickets(
 @app.get("/tickets/{ticket_id}")
 def get_ticket(ticket_id: str, db: Session = Depends(get_db)):
     """Get a single ticket by ID."""
-    ticket = db.query(Ticket).filter(Ticket.id == ticket_id).first()
+    ticket = db.query(Ticket).filter(Ticket.id == _ticket_uuid(ticket_id)).first()
     if not ticket:
         raise HTTPException(status_code=404, detail="Ticket not found")
     return _ticket_to_dict(ticket)
@@ -613,7 +647,7 @@ def get_ticket(ticket_id: str, db: Session = Depends(get_db)):
 @app.put("/tickets/{ticket_id}/read")
 def mark_ticket_read(ticket_id: str, db: Session = Depends(get_db)):
     """Mark a ticket as read (is_read = True). Idempotent."""
-    ticket = db.query(Ticket).filter(Ticket.id == ticket_id).first()
+    ticket = db.query(Ticket).filter(Ticket.id == _ticket_uuid(ticket_id)).first()
     if not ticket:
         raise HTTPException(status_code=404, detail="Ticket not found")
     if not ticket.is_read:
@@ -626,7 +660,7 @@ def mark_ticket_read(ticket_id: str, db: Session = Depends(get_db)):
 @app.patch("/tickets/{ticket_id}/approve")
 def approve_ticket(ticket_id: str, db: Session = Depends(get_db)):
     """Approve the AI draft — marks ticket as 'In Progress'."""
-    ticket = db.query(Ticket).filter(Ticket.id == ticket_id).first()
+    ticket = db.query(Ticket).filter(Ticket.id == _ticket_uuid(ticket_id)).first()
     if not ticket:
         raise HTTPException(status_code=404, detail="Ticket not found")
 
@@ -639,7 +673,7 @@ def approve_ticket(ticket_id: str, db: Session = Depends(get_db)):
 @app.post("/approve_ticket/{ticket_id}")
 def approve_and_close_ticket(ticket_id: str, db: Session = Depends(get_db)):
     """Approve the AI draft, send it via email, and close the ticket."""
-    ticket = db.query(Ticket).filter(Ticket.id == ticket_id).first()
+    ticket = db.query(Ticket).filter(Ticket.id == _ticket_uuid(ticket_id)).first()
     if not ticket:
         raise HTTPException(status_code=404, detail="Ticket not found")
 
@@ -672,7 +706,7 @@ def approve_and_close_ticket(ticket_id: str, db: Session = Depends(get_db)):
 @app.patch("/tickets/{ticket_id}/reject")
 def reject_ticket(ticket_id: str, db: Session = Depends(get_db)):
     """Reject the AI draft — marks ticket as 'Closed'."""
-    ticket = db.query(Ticket).filter(Ticket.id == ticket_id).first()
+    ticket = db.query(Ticket).filter(Ticket.id == _ticket_uuid(ticket_id)).first()
     if not ticket:
         raise HTTPException(status_code=404, detail="Ticket not found")
 
@@ -760,7 +794,6 @@ def fetch_emails_endpoint(
     try:
         mail = imaplib.IMAP4_SSL("imap.gmail.com", 993)
         mail.login(EMAIL_USER, EMAIL_PASSWORD)
-        mail.select("INBOX")
         print(f"  ✅ Connected to Gmail as {EMAIL_USER}")
     except Exception as e:
         print(f"  ❌ IMAP connection failed: {e}")
@@ -768,34 +801,55 @@ def fetch_emails_endpoint(
 
     # ── Search for emails ──
     try:
-        # Use date-based search instead of UNSEEN to catch emails that
-        # were auto-marked as read by Gmail / phone within seconds.
-        # This way we never miss emails. Duplicates are filtered by
-        # the email_body check against the DB below.
         from datetime import datetime as _dt, timedelta as _td
+
+        since_date = (_dt.now() - _td(days=2)).strftime("%d-%b-%Y")
         if include_read:
-            search_criteria = "ALL"
+            # Explicit read-mail sync: include recent Inbox + Sent + All Mail.
+            search_plan = [
+                ("INBOX", f'(SINCE "{since_date}")'),
+                ("[Gmail]/Sent Mail", f'(SINCE "{since_date}")'),
+                ("[Gmail]/All Mail", f'(SINCE "{since_date}")'),
+            ]
         else:
-            # Fetch emails from the last 2 days (IMAP SINCE uses date only, no time)
-            since_date = (_dt.now() - _td(days=2)).strftime("%d-%b-%Y")
-            search_criteria = f'(SINCE "{since_date}")'
-        status, messages = mail.search(None, search_criteria)
-        print(f"  🔍 Search criteria: {search_criteria}  status: {status}")
+            # New-mail sync: only unread inbox items to avoid refetching older read emails.
+            search_plan = [("INBOX", "UNSEEN")]
 
-        if status != "OK":
-            raise HTTPException(status_code=500, detail="Could not search mailbox.")
+        mailbox_email_ids: list[tuple[str, bytes]] = []
 
-        email_ids = messages[0].split()
-        # Take only the most recent N emails (last items = newest)
-        email_ids = email_ids[-max_emails:] if len(email_ids) > max_emails else email_ids
+        for mailbox, criteria in search_plan:
+            try:
+                status, _ = mail.select(_quote_mailbox(mailbox), readonly=False)
+                if status != "OK":
+                    continue
+                status, messages = mail.search(None, criteria)
+                print(f"  🔍 Mailbox={mailbox} criteria={criteria} status={status}")
+                if status != "OK":
+                    continue
+                mailbox_email_ids.extend((mailbox, eid) for eid in messages[0].split())
+            except Exception as mailbox_err:
+                print(f"  ⚠️ Skipping mailbox {mailbox}: {mailbox_err}")
+
+        # Remove duplicates while preserving order, then take the newest N items.
+        seen_keys = set()
+        deduped: list[tuple[str, bytes]] = []
+        for mailbox, eid in mailbox_email_ids:
+            key = (mailbox, eid)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            deduped.append((mailbox, eid))
+
+        email_ids = deduped[-max_emails:] if len(deduped) > max_emails else deduped
         print(f"  📬 Found {len(email_ids)} email(s) to process")
 
         results = []
         errors = []
         skipped_dupes = 0
 
-        for eid in email_ids:
+        for mailbox, eid in email_ids:
             try:
+                mail.select(_quote_mailbox(mailbox), readonly=False)
                 st_fetch, msg_data = mail.fetch(eid, "(RFC822)")
                 if st_fetch != "OK":
                     continue

@@ -1,8 +1,7 @@
 import uuid
 import enum
 from datetime import datetime, timezone
-from sqlalchemy import Boolean, Column, String, Text, Enum, DateTime
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import Boolean, Column, String, Text, Enum, DateTime, Uuid
 
 from database import Base
 
@@ -35,7 +34,7 @@ class Ticket(Base):
     __tablename__ = "tickets"
 
     id = Column(
-        UUID(as_uuid=True),
+        Uuid(as_uuid=True),
         primary_key=True,
         default=uuid.uuid4,
         index=True,
