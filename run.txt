@@ -1,0 +1,94 @@
+═══════════════════════════════════════════════════════════════════
+DEPLOYMENT OPTIONS
+═══════════════════════════════════════════════════════════════════
+
+LOCAL RUN (Single Streamlit App):
+Set-Location "D:\Triage Agent Final\finance-support-triage-agent-final-streamlit-1"
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
+& ".venv\Scripts\Activate.ps1"
+streamlit run streamlit_app.py
+
+Open: http://127.0.0.1:8501
+
+
+CLOUD DEPLOYMENT (Streamlit Cloud):
+See: STREAMLIT-QUICK-DEPLOY.md (3 easy steps!)
+1. Push to GitHub
+2. Deploy on https://share.streamlit.io
+3. Add secrets in Streamlit Cloud dashboard
+
+Result: Your app live at https://YOUR_USERNAME-finance-triage-agent.streamlit.app
+
+
+
+═══════════════════════════════════════════════════════════════════
+MANUAL DOCKER STARTUP (For Presentation):
+═══════════════════════════════════════════════════════════════════
+
+OPTION 1: Using docker-compose (Easiest):
+Set-Location "D:\Triage Agent Final\finance-support-triage-agent-final-streamlit-1"
+docker-compose up -d
+
+Then open: http://127.0.0.1:8501
+
+
+OPTION 2: Manual Docker Commands (Step-by-step):
+
+# Step 1: Create network
+docker network create finance-net
+
+# Step 2: Stop old containers if running
+docker rm -f finance-backend finance-frontend finance-quiz 2>$null
+
+# Step 3: Start Backend (API)
+docker run -d --name finance-backend --network finance-net --env-file ".env" -p 8000:8000 finance-backend:latest
+
+# Step 4: Start Frontend (Dashboard) - Wait 10 seconds for backend
+Start-Sleep -Seconds 10
+docker run -d --name finance-frontend --network finance-net --env-file ".env" -e API_BASE_URL=http://finance-backend:8000 -p 8501:8501 finance-frontend:latest
+
+# Step 5: Start Quiz Service
+docker run -d --name finance-quiz --network finance-net --env-file ".env" -e BACKEND_API_URL=http://finance-backend:8000 -p 8502:8501 finance-quiz:latest
+
+Then open: http://127.0.0.1:8501
+
+
+OPTION 3: Check if containers are running:
+docker ps
+
+OPTION 4: Stop all containers:
+docker-compose down
+OR
+docker rm -f finance-backend finance-frontend finance-quiz
+
+
+
+
+Docker run from Docker Hub images:
+Set-Location "D:\Triage Agent Final\finance-support-triage-agent-final-streamlit-1"
+
+docker network create finance-net
+
+docker rm -f ib if iq 2>$null
+
+docker run -d --name ib --network finance-net --env-file ".env" -p 8000:8000 krati2251/ib:v1
+docker run -d --name if --network finance-net --env-file ".env" -e API_BASE_URL=http://ib:8000 -p 8501:8501 krati2251/if:v1
+docker run -d --name iq --network finance-net --env-file ".env" -e BACKEND_API_URL=http://ib:8000 -p 8502:8501 krati2251/iq:v1
+
+
+
+
+Terminal 1: Start Backend
+cd "d:\Triage Agent Final\finance-support-triage-agent-final-streamlit-1"
+& ".\.venv\Scripts\python.exe" -m uvicorn main:app --app-dir backend --host 127.0.0.1 --port 8000
+
+
+Terminal 2: Start Streamlit
+cd "d:\Triage Agent Final\finance-support-triage-agent-final-streamlit-1"
+& ".\.venv\Scripts\python.exe" -m streamlit run streamlit_app.py --server.port 8501
+
+
+
+Backend API: http://127.0.0.1:8000 (port 8000)
+Frontend: http://127.0.0.1:8501 (port 8501) ✅ OPEN THIS
+Quiz Service: http://127.0.0.1:8502 (port 8502)

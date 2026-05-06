@@ -1,0 +1,48 @@
+services:
+  backend:
+    image: krati2251/ib:v2
+    container_name: integrated-backend
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/', timeout=5)"]
+      interval: 20s
+      timeout: 6s
+      retries: 5
+    networks:
+      - finance-net
+
+  frontend:
+    image: krati2251/if:v1
+    container_name: integrated-frontend
+    environment:
+      API_BASE_URL: http://backend:8000
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "8501:8501"
+    restart: unless-stopped
+    networks:
+      - finance-net
+
+  quiz:
+    image: krati2251/iq:v1
+    container_name: integrated-quiz
+    environment:
+      BACKEND_API_URL: http://backend:8000
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "8502:8501"
+    restart: unless-stopped
+    networks:
+      - finance-net
+
+networks:
+  finance-net:
+    driver: bridge

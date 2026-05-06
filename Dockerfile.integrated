@@ -1,0 +1,26 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# system deps needed for psycopg2 and building wheels
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       build-essential \
+       gcc \
+       libpq-dev \
+       curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# copy requirements and install
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+# copy app
+COPY . /app
+
+ENV PORT=8501
+ENV STREAMLIT_SERVER_PORT=$PORT
+ENV STREAMLIT_SERVER_ADDRESS=0.0.0.0
+EXPOSE 8501
+
+CMD ["streamlit", "run", "streamlit_app.py", "--server.port", "8501", "--server.address", "0.0.0.0"]

@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+venv/
+.venv/
+env/
+
+# Environment / secrets
+.env
+.streamlit/secrets.toml
+
+# Database (local SQLite)
+tickets.db
+*.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Archives
+*.rar
+*.zip
+*.tar.gz
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Terraform (infrastructure files)
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.backup
+terraform.tfstate
+terraform.tfstate.backup
+
+# Local/temp files
+triage_local.db
+backend_local.db
+
+# Embedded repo (exclude from main repo)
+quiz/Finance-Quiz-Bot/

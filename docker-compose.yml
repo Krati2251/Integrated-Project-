@@ -1,0 +1,107 @@
+version: '3.8'
+
+services:
+  # ═══════════════════════════════════════════════════════════════════
+  # BACKEND API (FastAPI + Uvicorn)
+  # ═══════════════════════════════════════════════════════════════════
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: finance-backend
+    image: finance-backend:latest
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      - ENABLE_EMAIL_POLLING=true
+      - EMAIL_POLL_INTERVAL=300
+    restart: unless-stopped
+    networks:
+      - finance-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ═══════════════════════════════════════════════════════════════════
+  # FRONTEND STREAMLIT (Main Dashboard)
+  # ═══════════════════════════════════════════════════════════════════
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: finance-frontend
+    image: finance-frontend:latest
+    env_file:
+      - .env
+    environment:
+      - API_BASE_URL=http://backend:8000
+      - BACKEND_URL=http://backend:8000
+      - STREAMLIT_SERVER_PORT=8501
+      - STREAMLIT_SERVER_ADDRESS=0.0.0.0
+      - STREAMLIT_SERVER_HEADLESS=true
+      - STREAMLIT_CLIENT_SHOWERRORDETAILS=true
+    ports:
+      - "8501:8501"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - finance-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # ═══════════════════════════════════════════════════════════════════
+  # QUIZ SERVICE (Streamlit Finance Quiz)
+  # ═══════════════════════════════════════════════════════════════════
+  quiz:
+    build:
+      context: ./quiz/Finance-Quiz-Bot
+      dockerfile: Dockerfile
+    container_name: finance-quiz
+    image: finance-quiz:latest
+    env_file:
+      - .env
+    environment:
+      - BACKEND_API_URL=http://backend:8000
+      - STREAMLIT_SERVER_PORT=8501
+      - STREAMLIT_SERVER_ADDRESS=0.0.0.0
+      - STREAMLIT_SERVER_HEADLESS=true
+      - PYTHONPATH=/app
+    ports:
+      - "8502:8501"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - finance-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    volumes:
+      - quiz_data:/app/chroma_db
+
+# ═══════════════════════════════════════════════════════════════════
+# NETWORKS & VOLUMES
+# ═══════════════════════════════════════════════════════════════════
+networks:
+  finance-net:
+    driver: bridge
+
+volumes:
+  quiz_data:
+    driver: local
